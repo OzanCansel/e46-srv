@@ -9,7 +9,7 @@
 
 #define E46SRV_LISTEN_BACKLOG 256
 #define MAX_EVENTS            256
-#define ECHO_BUF_SIZE         4096
+#define ECHO_BUF_SIZE         65536
 
 static int make_socket_nonblocking(int fd)
 {
@@ -50,8 +50,21 @@ static void ntop(const struct sockaddr *addr, char *dst)
 
 int e46srv_listen(struct e46srv_cfg* cfg, struct e46srv_ctx *ctx)
 {
+    char READ_BUF[ECHO_BUF_SIZE];
     char LISTEN_IP_STR[64];
     int srv_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+
+    if (srv_fd == -1)
+    {
+        fprintf(
+            stderr,
+            "Cannot create server socket. err: %d(%s)",
+            errno,
+            strerror(errno)
+        );
+
+        return -1;
+    }
 
     int ok = 1;
     setsockopt(srv_fd, SOL_SOCKET, SO_REUSEADDR, &ok, sizeof(ok));
@@ -71,7 +84,7 @@ int e46srv_listen(struct e46srv_cfg* cfg, struct e46srv_ctx *ctx)
             strerror(errno)
         );
 
-        return -1;
+        return -2;
     }
 
     int listen_res = listen(srv_fd, E46SRV_LISTEN_BACKLOG);
@@ -85,7 +98,7 @@ int e46srv_listen(struct e46srv_cfg* cfg, struct e46srv_ctx *ctx)
             strerror(errno)
         );
 
-        return -2;
+        return -3;
     }
 
     int nonblock_res = make_socket_nonblocking(srv_fd);
@@ -99,7 +112,7 @@ int e46srv_listen(struct e46srv_cfg* cfg, struct e46srv_ctx *ctx)
             strerror(errno)
         );
 
-        return -3;
+        return -4;
     }
 
     ctx->srv_fd = srv_fd;
@@ -114,7 +127,7 @@ int e46srv_listen(struct e46srv_cfg* cfg, struct e46srv_ctx *ctx)
             strerror(errno)
         );
 
-        return -4;
+        return -5;
     }
 
     struct epoll_event ep_req, events[MAX_EVENTS];
@@ -131,7 +144,7 @@ int e46srv_listen(struct e46srv_cfg* cfg, struct e46srv_ctx *ctx)
             strerror(errno)
         );
 
-        return -5;
+        return -6;
     }
 
     ntop((struct sockaddr*)&cfg->listen, LISTEN_IP_STR);
@@ -204,9 +217,13 @@ int e46srv_listen(struct e46srv_cfg* cfg, struct e46srv_ctx *ctx)
                     }
                 }
             }
+            else if (e->events & (EPOLLHUP | EPOLLRDHUP))
+            {
+                // Somehow peer closed the socket unexpectedly, so we close as well.
+                close(e->data.fd);
+            }
             else
             {
-                char READ_BUF[ECHO_BUF_SIZE];
                 int client_fd = e->data.fd;
 
                 // What we are doing is trying to implement an echo server.
@@ -220,7 +237,8 @@ int e46srv_listen(struct e46srv_cfg* cfg, struct e46srv_ctx *ctx)
                 {
                     READ_BUF[npeek] = '\0';
 
-                    printf("fd: %d => %s", client_fd, READ_BUF);
+                    if (cfg->print)
+                        printf("fd: %d => %s", client_fd, READ_BUF);
 
                     ssize_t nwritten = send(client_fd, READ_BUF, npeek, 0);
 

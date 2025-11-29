@@ -6,6 +6,7 @@
 struct e46srv_cfg
 {
     struct sockaddr_in listen;
+    int print;
 };
 
 struct e46srv_ctx

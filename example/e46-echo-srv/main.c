@@ -13,9 +13,10 @@ int main(int argc, char **argv)
     memset(&cfg, 0, sizeof(cfg));
     memset(&ctx, 0, sizeof(ctx));
 
-    cfg.listen.sin_family = AF_INET;
-    cfg.listen.sin_port   = htons(5430);
-    inet_aton("127.0.0.1", &cfg.listen.sin_addr);
+    cfg.listen.sin_family      = AF_INET;
+    cfg.listen.sin_port        = htons(5430);
+    cfg.listen.sin_addr.s_addr = INADDR_ANY;
+    cfg.print                  = 0;
 
     e46srv_listen(&cfg, &ctx);
 
