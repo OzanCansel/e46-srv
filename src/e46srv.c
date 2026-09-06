@@ -1,15 +1,35 @@
 #include "e46srv.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <errno.h>
 #include <string.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/epoll.h>
+#include <sys/queue.h>
 #include <arpa/inet.h>
 
 #define E46SRV_LISTEN_BACKLOG 256
 #define MAX_EVENTS            256
 #define ECHO_BUF_SIZE         65536
+
+struct buffer
+{
+    void *payload;
+    int  len;
+
+    TAILQ_ENTRY(buffer) entries;
+};
+
+TAILQ_HEAD(buffer_head, buffer);
+
+struct client_ctx
+{
+    struct buffer_head bhead;
+    int n_awaits;
+    int client_fd;
+    uint32_t epoll_cfg;
+};
 
 static int make_socket_nonblocking(int fd)
 {
@@ -38,7 +58,7 @@ static void ntop(const struct sockaddr *addr, char *dst)
         break;
         case AF_INET6:
             struct  sockaddr_in6 *addr6 = (struct sockaddr_in6*)addr;
-            inet_ntop(AF_INET, &addr6->sin6_addr, dst, INET6_ADDRSTRLEN);
+            inet_ntop(AF_INET6, &addr6->sin6_addr, dst, INET6_ADDRSTRLEN);
 
             port = ntohs(addr6->sin6_port);
         break;
@@ -46,6 +66,22 @@ static void ntop(const struct sockaddr *addr, char *dst)
 
     sprintf(PORT_STR, ":%d", port);
     strcat(dst, PORT_STR);
+}
+
+static void cleanup_client_ctx(struct client_ctx *cli_ctx)
+{
+    struct buffer *curr;
+
+    while (!TAILQ_EMPTY(&cli_ctx->bhead))
+    {
+        curr = TAILQ_FIRST(&cli_ctx->bhead);
+
+        free(curr->payload);
+        TAILQ_REMOVE(&cli_ctx->bhead, curr, entries);
+        free(curr);
+    }
+
+    free(cli_ctx);
 }
 
 int e46srv_listen(struct e46srv_cfg* cfg, struct e46srv_ctx *ctx)
@@ -116,6 +152,8 @@ int e46srv_listen(struct e46srv_cfg* cfg, struct e46srv_ctx *ctx)
     }
 
     ctx->srv_fd = srv_fd;
+    ctx->lowat  = cfg->lowat;
+    ctx->hiwat  = cfg->hiwat;
     ctx->epoll_fd = epoll_create1(0);
 
     if (ctx->epoll_fd == -1)
@@ -185,7 +223,6 @@ int e46srv_listen(struct e46srv_cfg* cfg, struct e46srv_ctx *ctx)
                     printf("Accepted new client. addr: %s\n", CLI_IP_STR);
 
                     ep_req.events  = EPOLLIN;
-                    ep_req.data.fd = client_fd;
 
                     if (make_socket_nonblocking(client_fd) == -1)
                     {
@@ -202,6 +239,31 @@ int e46srv_listen(struct e46srv_cfg* cfg, struct e46srv_ctx *ctx)
                         continue;
                     }
 
+                    struct client_ctx *cli_ctx = (struct client_ctx*)malloc(sizeof(*cli_ctx));
+
+                    if (cli_ctx == NULL)
+                    {
+                        close(client_fd);
+
+                        fprintf(
+                            stderr,
+                            "Could not allocate client_ctx. fd: %d, err: %d(%s)\n",
+                            client_fd,
+                            errno,
+                            strerror(errno)
+                        );
+
+                        continue;
+                    }
+
+                    memset(cli_ctx, 0, sizeof(*cli_ctx));
+
+                    TAILQ_INIT(&cli_ctx->bhead);
+                    cli_ctx->epoll_cfg = EPOLLIN;
+                    cli_ctx->client_fd = client_fd;
+
+                    ep_req.data.ptr = cli_ctx;
+
                     // Inform kernel to listen `client_fd` as well.
                     if (epoll_ctl(ctx->epoll_fd, EPOLL_CTL_ADD, client_fd, &ep_req) == -1)
                     {
@@ -213,6 +275,7 @@ int e46srv_listen(struct e46srv_cfg* cfg, struct e46srv_ctx *ctx)
                             strerror(errno)
                         );
 
+                        free(cli_ctx);
                         close(client_fd);
                     }
                 }
@@ -220,94 +283,174 @@ int e46srv_listen(struct e46srv_cfg* cfg, struct e46srv_ctx *ctx)
             else if (e->events & (EPOLLHUP | EPOLLRDHUP))
             {
                 // Somehow peer closed the socket unexpectedly, so we close as well.
-                close(e->data.fd);
+                struct client_ctx *cli_ctx = (struct client_ctx*)e->data.ptr;
+
+                close(cli_ctx->client_fd);
+                cleanup_client_ctx(cli_ctx);
+
+                e->data.ptr = NULL;
             }
             else
             {
-                int client_fd = e->data.fd;
+                struct client_ctx *cli_ctx = e->data.ptr;
+                int client_fd = cli_ctx->client_fd;
 
-                // What we are doing is trying to implement an echo server.
-                // So to accomplish this we need to echo back what we have read.
-                // At the time of `recv` called, we dont know whether we will succeed
-                // to send data back. So that's why we dont drain buffer and use `MSG_PEEK`
-                int npeek = recv(client_fd, READ_BUF, sizeof(READ_BUF) - 1, MSG_PEEK);
-
-                // We have read data
-                if (npeek > 0)
+                // If writeable and there are awaiting bytes
+                if ((e->events & EPOLLOUT) == EPOLLOUT && cli_ctx->n_awaits > 0)
                 {
-                    READ_BUF[npeek] = '\0';
-
-                    if (cfg->print)
-                        printf("fd: %d => %s", client_fd, READ_BUF);
-
-                    ssize_t nwritten = send(client_fd, READ_BUF, npeek, 0);
-
-                    // Successfull write
-                    if (nwritten > 0)
+                    if (!TAILQ_EMPTY(&cli_ctx->bhead))
                     {
-                        ssize_t ndrained = recv(client_fd, READ_BUF, nwritten, 0);
+                        struct buffer *curr = TAILQ_FIRST(&cli_ctx->bhead);
 
-                        if (ndrained < 0)
+                        ssize_t n_written = send(client_fd, curr->payload, curr->len, MSG_NOSIGNAL);
+
+                        if (n_written > 0)
                         {
-                            // We have a big problem here
-                            // at least, report it
-                            fprintf(
-                                stderr,
-                                "ERR! Echoed back %ld bytes successfully but could not drained. "
-                                "fd: %d, ret: %ld, err: %d(%s)\n",
-                                nwritten,
-                                client_fd,
-                                ndrained,
-                                errno,
-                                strerror(errno)
-                            );
+                            if (n_written < curr->len)
+                            {
+                                memmove(curr->payload, curr->payload + n_written, curr->len - n_written);
 
-                            // We lost the integrity, at least close the fd;
-                            close(client_fd);
+                                curr->len = curr->len - n_written;
+                                cli_ctx->n_awaits -= n_written;
+                            }
+                            else
+                            {
+                                cli_ctx->n_awaits -= n_written;
+
+                                free(curr->payload);
+                                TAILQ_REMOVE(&cli_ctx->bhead, curr, entries);
+                                free(curr);
+                            }
                         }
-                        else if (ndrained == 0) // Is it possible to peer closed connection ?
+                        else if (n_written == 0)
                         {
-                            // If this is the case, no problem
-                            fprintf(
-                                stderr,
-                                "Echoed back and client closed. Looks strange. fd: %d\n",
-                                client_fd
-                            );
-
-                            close(client_fd);
-                        }
-                        else if (ndrained != nwritten)
-                        { // Ok, we drained buffer. I hope ndrained == nwritten
-                            fprintf(
-                                stderr,
-                                "ERR! Could not drained same amount of bytes echoed back. "
-                                "fd: %d, nwritten: %ld, ndrained: %ld\n",
-                                client_fd,
-                                nwritten,
-                                ndrained
-                            );
+                            break;
                         }
                     }
                 }
-                else if (npeek == 0) // Means, client closed the connection.
-                {
-                    printf("Peer closed the connection. fd: %d\n", client_fd);
 
-                    close(client_fd);
+                // If configured to EPOLLIN and there are readable bytes
+                if ((cli_ctx->epoll_cfg & EPOLLIN) && e->events & EPOLLIN)
+                {
+                    int nread = recv(client_fd, READ_BUF, sizeof(READ_BUF) - 1, 0);
+
+                    if (nread > 0)
+                    {
+                        READ_BUF[nread] = '\0';
+
+                        if (cfg->print)
+                            printf("fd: %d => %s", client_fd, READ_BUF);
+
+                        // Buffer directly if there awaiting bytes
+                        if (cli_ctx->n_awaits > 0)
+                        {
+                            struct buffer *buf = (struct buffer*)malloc(sizeof(*buf));
+
+                            buf->payload = malloc(nread);
+                            buf->len     = nread;
+
+                            TAILQ_INSERT_TAIL(&cli_ctx->bhead, buf, entries);
+
+                            cli_ctx->n_awaits += buf->len;
+                        }
+                        else
+                        {
+                            ssize_t nwritten = send(client_fd, READ_BUF, nread, MSG_NOSIGNAL);
+
+                            // Successfull write
+                            if (nwritten > 0)
+                            {
+                                // Partial write
+                                if (nwritten < nread)
+                                {
+                                    // Buffer leftover part
+                                    struct buffer *buf = (struct buffer*)malloc(sizeof(*buf));
+
+                                    int leftover = nread - nwritten;
+
+                                    buf->payload = malloc(leftover);
+                                    buf->len     = leftover;
+
+                                    TAILQ_INSERT_TAIL(&cli_ctx->bhead, buf, entries);
+
+                                    cli_ctx->n_awaits += buf->len;
+                                }
+                            }
+                            else
+                            {
+                                // Write is not successfull, so buffer it
+                                struct buffer *buf = (struct buffer*)malloc(sizeof(*buf));
+
+                                buf->payload = malloc(nread);
+                                buf->len     = nread;
+
+                                TAILQ_INSERT_TAIL(&cli_ctx->bhead, buf, entries);
+
+                                cli_ctx->n_awaits += buf->len;
+                            }
+                        }
+                    }
+                    else if (nread == 0) // Means, client closed the connection.
+                    {
+                        close(client_fd);
+                        cleanup_client_ctx(cli_ctx);
+                        cli_ctx = NULL;
+
+                        printf("Peer closed the connection. fd: %d\n", client_fd);
+                    }
+                    else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != ENOBUFS)
+                    {
+                        // Unexpected errno, so close connection
+                        close(client_fd);
+                        cleanup_client_ctx(cli_ctx);
+                        cli_ctx = NULL;
+
+                        fprintf(
+                            stderr,
+                            "recv failed with unexpected errno so closing client. fd: %d, err: %d(%s)\n",
+                            client_fd,
+                            errno,
+                            strerror(errno)
+                        );
+                    }
                 }
-                else if (npeek != EAGAIN)
-                {
-                    // Handle error
-                    fprintf(
-                        stderr,
-                        "ERR! Closing socket. fd: %d, code: %d, err: %d(%s)\n",
-                        client_fd,
-                        npeek,
-                        errno,
-                        strerror(errno)
-                    );
 
-                    close(client_fd);
+                if (cli_ctx)
+                {
+                    uint32_t desired = 0;
+
+                    if (cli_ctx->n_awaits > 0)
+                        desired |= EPOLLOUT;
+
+                    // If not listening READ events but awaiting bytes under the low watermark
+                    // Start to listen READ events
+                    if ((cli_ctx->epoll_cfg & EPOLLIN) == 0 && cli_ctx->n_awaits < ctx->lowat)
+                        desired |= EPOLLIN;
+
+                    // If already listening READ events and awaiting bytes still under the high watermark
+                    // Keep listening READ events
+                    if (((cli_ctx->epoll_cfg & EPOLLIN) == EPOLLIN) && cli_ctx->n_awaits < ctx->hiwat)
+                        desired |= EPOLLIN;
+
+                    if (cli_ctx->epoll_cfg != desired)
+                    {
+                        e->events = desired;
+
+                        if (epoll_ctl(ctx->epoll_fd, EPOLL_CTL_MOD, client_fd, e) == 0)
+                        {
+                            cli_ctx->epoll_cfg = desired;
+                        }
+                        else
+                        {
+                            fprintf(
+                                stderr,
+                                "Could not configure desired event for client. fd: %d, err: %d(%s)\n",
+                                client_fd,
+                                errno,
+                                strerror(errno)
+                            );
+                        }
+                    }
                 }
             }
         }

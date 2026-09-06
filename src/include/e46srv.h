@@ -7,12 +7,16 @@ struct e46srv_cfg
 {
     struct sockaddr_in listen;
     int print;
+    int hiwat;
+    int lowat;
 };
 
 struct e46srv_ctx
 {
     int srv_fd;
     int epoll_fd;
+    int hiwat;
+    int lowat;
 };
 
 int e46srv_listen(struct e46srv_cfg *cfg, struct e46srv_ctx* ctx);

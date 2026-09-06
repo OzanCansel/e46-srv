@@ -16,6 +16,8 @@ int main(int argc, char **argv)
     cfg.listen.sin_family      = AF_INET;
     cfg.listen.sin_port        = htons(5430);
     cfg.listen.sin_addr.s_addr = INADDR_ANY;
+    cfg.lowat                  = 1024 * 1024;
+    cfg.hiwat                  = cfg.lowat * 3;
     cfg.print                  = 0;
 
     e46srv_listen(&cfg, &ctx);
